@@ -5,6 +5,7 @@ set(SRCS
             arm/dyncom/arm_dyncom_dec.cpp
             arm/dyncom/arm_dyncom_interpreter.cpp
             arm/dyncom/arm_dyncom_thumb.cpp
+            arm/dyncom/arm_dyncom_trans.cpp
             arm/skyeye_common/armstate.cpp
             arm/skyeye_common/armsupp.cpp
             arm/skyeye_common/vfp/vfp.cpp
@@ -26,6 +27,7 @@ set(SRCS
             hle/config_mem.cpp
             hle/hle.cpp
             hle/applets/applet.cpp
+            hle/applets/erreula.cpp
             hle/applets/mii_selector.cpp
             hle/applets/swkbd.cpp
             hle/kernel/address_arbiter.cpp
@@ -142,6 +144,7 @@ set(HEADERS
             arm/dyncom/arm_dyncom_interpreter.h
             arm/dyncom/arm_dyncom_run.h
             arm/dyncom/arm_dyncom_thumb.h
+            arm/dyncom/arm_dyncom_trans.h
             arm/skyeye_common/arm_regformat.h
             arm/skyeye_common/armstate.h
             arm/skyeye_common/armsupp.h
@@ -166,6 +169,7 @@ set(HEADERS
             hle/function_wrappers.h
             hle/hle.h
             hle/applets/applet.h
+            hle/applets/erreula.h
             hle/applets/mii_selector.h
             hle/applets/swkbd.h
             hle/kernel/address_arbiter.h
