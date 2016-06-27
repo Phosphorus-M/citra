@@ -67,10 +67,10 @@ if (NOT MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++1y -Wno-attributes")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
 
-    if (ARCHITECTURE_x86_64)
+#[[ if (ARCHITECTURE_x86_64)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse4.1")
         set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse4.1")
-    endif()
+    endif()]]
 
     if (MINGW)
         add_definitions(-DMINGW_HAS_SECURE_API)
@@ -175,7 +175,7 @@ IF (APPLE)
 ELSEIF(MINGW)
     # GCC does not support codecvt, so use iconv instead
     # PSAPI is the Process Status API
-    set(PLATFORM_LIBRARIES winmm ws2_32 psapi iconv)
+    set(PLATFORM_LIBRARIES winmm ws2_32 psapi)
 
     # WSAPoll functionality doesn't exist before WinNT 6.x (Vista and up)
     add_definitions(-D_WIN32_WINNT=0x0600)
