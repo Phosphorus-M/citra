@@ -35,7 +35,7 @@ static const ResultCode ERROR_MISALIGNED_SIZE =
     ResultCode(ErrorDescription::MisalignedSize,     ErrorModule::RO, ErrorSummary::WrongArgument,   ErrorLevel::Permanent);
 static const ResultCode ERROR_ILLEGAL_ADDRESS =
     ResultCode(static_cast<ErrorDescription>(15),    ErrorModule::RO, ErrorSummary::Internal,        ErrorLevel::Usage);
-static const ResultCode ERROR_INVALID_CRO =
+static const ResultCode ERROR_NOT_LOADED =
     ResultCode(static_cast<ErrorDescription>(13),    ErrorModule::RO, ErrorSummary::InvalidState,    ErrorLevel::Permanent);
 
 static const u32 CRO_HEADER_SIZE = 0x138;
@@ -114,9 +114,20 @@ class CROHelper {
     };
     static_assert(sizeof(ImportModuleEntry) == 20, "ImportModuleEntry has wrong size");
 
+    enum class PatchType : u8 {
+        Nothing = 0,
+        AbsoluteAddress = 2,
+        RelativeAddress = 3,
+        ThumbBranch = 10,
+        ArmBranch = 28,
+        ModifyArmBranch = 29,
+        AbsoluteAddress2 = 38,
+        AlignedRelativeAddress = 42,
+    };
+
     struct PatchEntry { // for ExternalPatchTable and StaticPatchTable
         u32 target_segment_tag; // to self's segment in ExternalPatchTable. to static module segment in StaticPatchTable?
-        u8 type;
+        PatchType type;
         u8 is_batch_end;
         u8 batch_resolved; // set at batch begin
         u8 unk3;
@@ -126,7 +137,7 @@ class CROHelper {
 
     struct InternalPatchEntry {
         u32 target_segment_tag;
-        u8 type;
+        PatchType type;
         u8 value_segment_index;
         u8 unk2;
         u8 unk3;
@@ -199,11 +210,35 @@ class CROHelper {
     };
     static_assert(Fix0Barrier == (CRO_HEADER_SIZE - CRO_HASH_SIZE) / 4, "CRO Header fields are wrong!");
 
-    static const std::array<int, 17> ENTRY_SIZE;
-    static const std::array<HeaderField, 4> FIX_BARRIERS;
+    static constexpr std::array<int, 17> ENTRY_SIZE {{
+        1, // code
+        1, // data
+        1, // module name
+        sizeof(SegmentEntry),
+        sizeof(ExportNamedSymbolEntry),
+        sizeof(ExportIndexedSymbolEntry),
+        1, // export strings
+        sizeof(ExportTreeEntry),
+        sizeof(ImportModuleEntry),
+        sizeof(PatchEntry),
+        sizeof(ImportNamedSymbolEntry),
+        sizeof(ImportIndexedSymbolEntry),
+        sizeof(ImportAnonymousSymbolEntry),
+        1, // import strings
+        sizeof(StaticAnonymousSymbolEntry),
+        sizeof(InternalPatchEntry),
+        sizeof(PatchEntry)
+    }};
 
-    static const u32 MAGIC_CRO0;
-    static const u32 MAGIC_FIXD;
+    static constexpr std::array<HeaderField, 4> FIX_BARRIERS {{
+        Fix0Barrier,
+        Fix1Barrier,
+        Fix2Barrier,
+        Fix3Barrier
+    }};
+
+    static constexpr u32 MAGIC_CRO0 = 0x304F5243;
+    static constexpr u32 MAGIC_FIXD = 0x44584946;
 
     VAddr Field(HeaderField field) {
         return address + CRO_HASH_SIZE + field * 4;
@@ -265,6 +300,8 @@ class CROHelper {
      */
     template <HeaderField field, typename T>
     void GetEntry(int index, T& data) {
+        static_assert(field >= SegmentTableOffset && field < Fix0Barrier && (field - SegmentTableOffset) % 2 == 0, "Invalid field name!");
+        static_assert(ENTRY_SIZE[(field - CodeOffset) / 2] == sizeof(T), "Field and entry mismatch!");
         static_assert(std::is_pod<T>::value, "The entry type must be POD!");
         Memory::ReadBlock(GetField(field) + index * sizeof(T), &data, sizeof(T));
     }
@@ -629,17 +666,52 @@ class CROHelper {
      *        Usually equals to target_address, but will be different for a target in .data segment
      * @returns ResultCode indicating the result of the operation, 0 on success
      */
-    ResultCode ApplyPatch(VAddr target_address, u8 patch_type, u32 shift, u32 symbol_address, u32 target_future_address) {
+    ResultCode ApplyPatch(VAddr target_address, PatchType patch_type, u32 shift, u32 symbol_address, u32 target_future_address) {
         switch (patch_type) {
-            case 2:
-                Memory::Write32(target_address, symbol_address + shift); // writes an obsolute address value
+            case PatchType::Nothing:
                 break;
-            case 3:
-                Memory::Write32(target_address, symbol_address + shift - target_future_address); // writes an relative address value
+            case PatchType::AbsoluteAddress:
+            case PatchType::AbsoluteAddress2:
+                Memory::Write32(target_address, symbol_address + shift);
                 break;
-            // TODO implement more types
+            case PatchType::RelativeAddress:
+                Memory::Write32(target_address, symbol_address + shift - target_future_address);
+                break;
+            case PatchType::ThumbBranch:
+            case PatchType::ArmBranch:
+            case PatchType::ModifyArmBranch:
+            case PatchType::AlignedRelativeAddress:
+                UNIMPLEMENTED();
+                break;
             default:
-                return CROFormatError(0x23);
+                return CROFormatError(0x22);
+        }
+        return RESULT_SUCCESS;
+    }
+
+    /**
+     * Clears a patch to zero
+     * @param target_address where to apply the patch
+     * @param patch_type the type of the patch
+     * @returns ResultCode indicating the result of the operation, 0 on success
+     */
+    ResultCode ClearPatch(VAddr target_address, PatchType patch_type) {
+        switch (patch_type) {
+            case PatchType::Nothing:
+                break;
+            case PatchType::AbsoluteAddress:
+            case PatchType::AbsoluteAddress2:
+            case PatchType::RelativeAddress:
+                Memory::Write32(target_address, 0);
+                break;
+            case PatchType::ThumbBranch:
+            case PatchType::ArmBranch:
+            case PatchType::ModifyArmBranch:
+            case PatchType::AlignedRelativeAddress:
+                UNIMPLEMENTED();
+                break;
+            default:
+                return CROFormatError(0x22);
         }
         return RESULT_SUCCESS;
     }
@@ -666,6 +738,35 @@ class CROHelper {
             ResultCode result = ApplyPatch(patch_target, patch.type, patch.shift, unresolved_symbol, patch_target);
             if (result.IsError()) {
                 LOG_ERROR(Service_LDR, "Error applying patch %08X", result.raw);
+                return result;
+            }
+
+            if (batch_begin) {
+                patch.batch_resolved = 0; // reset to unresolved state
+                SetEntry<ExternalPatchTableOffset>(i, patch);
+            }
+
+            batch_begin = patch.is_batch_end != 0; // current is end, next is begin
+        }
+
+        return RESULT_SUCCESS;
+    }
+
+    /// Clears all external patches to zero.
+    ResultCode ClearAllExternalPatches() {
+        u32 external_patch_num = GetField(ExternalPatchNum);
+        PatchEntry patch;
+
+        bool batch_begin = true;
+        for (u32 i = 0; i < external_patch_num; ++i) {
+            GetEntry<ExternalPatchTableOffset>(i, patch);
+            VAddr patch_target = SegmentTagToAddress(patch.target_segment_tag);
+            if (patch_target == 0) {
+                return CROFormatError(0x12);
+            }
+            ResultCode result = ClearPatch(patch_target, patch.type);
+            if (result.IsError()) {
+                LOG_ERROR(Service_LDR, "Error clearing patch %08X", result.raw);
                 return result;
             }
 
@@ -782,6 +883,26 @@ class CROHelper {
             ResultCode result = ApplyPatch(target_address, patch.type, patch.shift, value_segment.offset, target_addressB);
             if (result.IsError()) {
                 LOG_ERROR(Service_LDR, "Error applying patch %08X", result.raw);
+                return result;
+            }
+        }
+        return RESULT_SUCCESS;
+    }
+
+    /// Clears all internal patches to zero.
+    ResultCode ClearInternalPatches() {
+        u32 internal_patch_num = GetField(InternalPatchNum);
+        for (u32 i = 0; i < internal_patch_num; ++i) {
+            InternalPatchEntry patch;
+            GetEntry<InternalPatchTableOffset>(i, patch);
+            VAddr target_address = SegmentTagToAddress(patch.target_segment_tag);
+            if (target_address == 0) {
+                return CROFormatError(0x15);
+            }
+
+            ResultCode result = ClearPatch(target_address, patch.type);
+            if (result.IsError()) {
+                LOG_ERROR(Service_LDR, "Error clearing patch %08X", result.raw);
                 return result;
             }
         }
@@ -929,7 +1050,6 @@ class CROHelper {
     /// Resets all imported named symbols of this module to unresolved state
     ResultCode ResetImportNamedSymbol() {
         u32 unresolved_symbol = SegmentTagToAddress(GetField(OnUnresolvedSegmentTag));
-        u32 import_strings_size = GetField(ImportStringsSize);
         u32 symbol_import_num = GetField(ImportNamedSymbolNum);
         for (u32 i = 0; i < symbol_import_num; ++i) {
             ImportNamedSymbolEntry entry;
@@ -1485,6 +1605,21 @@ public:
         return RESULT_SUCCESS;
     }
 
+    ResultCode ClearPatches() {
+        ResultCode result = ClearAllExternalPatches();
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error clearing external patches %08X", result.raw);
+            return result;
+        }
+
+        result = ClearInternalPatches();
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error clearing internal patches %08X", result.raw);
+            return result;
+        }
+        return RESULT_SUCCESS;
+    }
+
     void RegisterCRS() {
         SetNext(0);
         SetPrevious(0);
@@ -1615,37 +1750,16 @@ public:
 
         return true;
     }
+
+    bool IsFixed() {
+        return GetField(Magic) == MAGIC_FIXD;
+    }
 };
 
-const std::array<int, 17> CROHelper::ENTRY_SIZE {{
-    1, // code
-    1, // data
-    1, // module name
-    sizeof(SegmentEntry),
-    sizeof(ExportNamedSymbolEntry),
-    sizeof(ExportIndexedSymbolEntry),
-    1, // export strings
-    sizeof(ExportTreeEntry),
-    sizeof(ImportModuleEntry),
-    sizeof(PatchEntry),
-    sizeof(ImportNamedSymbolEntry),
-    sizeof(ImportIndexedSymbolEntry),
-    sizeof(ImportAnonymousSymbolEntry),
-    1, // import strings
-    sizeof(StaticAnonymousSymbolEntry),
-    sizeof(InternalPatchEntry),
-    sizeof(PatchEntry)
-}};
-
-const std::array<CROHelper::HeaderField, 4> CROHelper::FIX_BARRIERS {{
-    Fix0Barrier,
-    Fix1Barrier,
-    Fix2Barrier,
-    Fix3Barrier
-}};
-
-const u32 CROHelper::MAGIC_CRO0 = 0x304F5243;
-const u32 CROHelper::MAGIC_FIXD = 0x44584946;
+constexpr std::array<int, 17> CROHelper::ENTRY_SIZE;
+constexpr std::array<CROHelper::HeaderField, 4> CROHelper::FIX_BARRIERS;
+constexpr u32 CROHelper::MAGIC_CRO0;
+constexpr u32 CROHelper::MAGIC_FIXD;
 
 // This is a work-around before we implement memory aliasing.
 // CRS and CRO are mapped (aliased) to another memory when loading,
@@ -1660,20 +1774,31 @@ public:
         memory_blocks.clear();
     }
 
-    void AddMemoryBlock(VAddr source, VAddr dest, u32 size) {
-        memory_blocks[source] = std::make_tuple(dest, size);
+    void AddMemoryBlock(VAddr mapping, VAddr original, u32 size) {
+        memory_blocks[mapping] = std::make_tuple(original, size);
     }
 
     void RemoveMemoryBlock(VAddr source) {
         memory_blocks.erase(source);
     }
 
-    void SynchronizeMemory() {
+    void SynchronizeOriginalMemory() {
         for (auto block : memory_blocks) {
-            VAddr source, dest;
+            VAddr mapping, original;
             u32 size;
-            std::tie(dest, size) = block.second;
-            Memory::CopyBlock(dest, block.first, size);
+            mapping = block.first;
+            std::tie(original, size) = block.second;
+            Memory::CopyBlock(original, mapping, size);
+        }
+    }
+
+    void SynchronizeMappingMemory() {
+        for (auto block : memory_blocks) {
+            VAddr mapping, original;
+            u32 size;
+            mapping = block.first;
+            std::tie(original, size) = block.second;
+            Memory::CopyBlock(mapping, original, size);
         }
     }
 };
@@ -1686,7 +1811,7 @@ static MemorySynchronizer memory_synchronizer;
  *      1 : CRS buffer pointer
  *      2 : CRS Size
  *      3 : Process memory address where the CRS will be mapped
- *      4 : Copy handle descriptor (zero)
+ *      4 : Copy handle descriptor (zero) // TODO copy or move???
  *      5 : KProcess handle
  *  Outputs:
  *      0 : Return header
@@ -1697,9 +1822,18 @@ static void Initialize(Service::Interface* self) {
     VAddr crs_buffer  = cmd_buff[1];
     u32 crs_size      = cmd_buff[2];
     VAddr crs_address = cmd_buff[3];
+    u32 descriptor    = cmd_buff[4];
+    u32 process       = cmd_buff[5];
 
-    LOG_WARNING(Service_LDR, "called. loading CRS from 0x%08X to 0x%08X, size = 0x%X",
-                crs_buffer, crs_address, crs_size);
+    LOG_WARNING(Service_LDR, "called. loading CRS from 0x%08X to 0x%08X, size = 0x%X. Process = 0x%08X",
+                crs_buffer, crs_address, crs_size, process);
+
+    if (descriptor != 0) {
+        LOG_ERROR(Service_LDR, "IPC handle descriptor failed validation (0x%X).", descriptor);
+        cmd_buff[0] = IPC::MakeHeader(0, 1, 0);
+        cmd_buff[1] = ResultCode(ErrorDescription::OS_InvalidBufferDescriptor, ErrorModule::OS, ErrorSummary::WrongArgument, ErrorLevel::Permanent).raw;
+        return;
+    }
 
     cmd_buff[0] = IPC::MakeHeader(1, 1, 0);
 
@@ -1765,7 +1899,7 @@ static void Initialize(Service::Interface* self) {
         return;
     }
 
-    memory_synchronizer.SynchronizeMemory();
+    memory_synchronizer.SynchronizeOriginalMemory();
 
     loaded_crs = crs_address;
 
@@ -1787,7 +1921,15 @@ static void LoadCRR(Service::Interface* self) {
     u32* cmd_buff = Kernel::GetCommandBuffer();
     u32 crr_buffer_ptr = cmd_buff[1];
     u32 crr_size       = cmd_buff[2];
+    u32 descriptor     = cmd_buff[3];
     u32 process        = cmd_buff[4];
+
+    if (descriptor != 0) {
+        LOG_ERROR(Service_LDR, "IPC handle descriptor failed validation (0x%X).", descriptor);
+        cmd_buff[0] = IPC::MakeHeader(0, 1, 0);
+        cmd_buff[1] = ResultCode(ErrorDescription::OS_InvalidBufferDescriptor, ErrorModule::OS, ErrorSummary::WrongArgument, ErrorLevel::Permanent).raw;
+        return;
+    }
 
     cmd_buff[0] = IPC::MakeHeader(2, 1, 0);
 
@@ -1810,7 +1952,15 @@ static void LoadCRR(Service::Interface* self) {
 static void UnloadCRR(Service::Interface* self) {
     u32* cmd_buff = Kernel::GetCommandBuffer();
     u32 crr_buffer_ptr = cmd_buff[1];
+    u32 descriptor     = cmd_buff[2];
     u32 process        = cmd_buff[3];
+
+    if (descriptor != 0) {
+        LOG_ERROR(Service_LDR, "IPC handle descriptor failed validation (0x%X).", descriptor);
+        cmd_buff[0] = IPC::MakeHeader(0, 1, 0);
+        cmd_buff[1] = ResultCode(ErrorDescription::OS_InvalidBufferDescriptor, ErrorModule::OS, ErrorSummary::WrongArgument, ErrorLevel::Permanent).raw;
+        return;
+    }
 
     cmd_buff[0] = IPC::MakeHeader(3, 1, 0);
 
@@ -1855,15 +2005,26 @@ static void LoadCRO(Service::Interface* self) {
     bool auto_link             = (cmd_buff[9] & 0xFF) != 0;
     u32 fix_level              = cmd_buff[10];
     VAddr crr_address          = cmd_buff[11];
+    u32 descriptor             = cmd_buff[12];
+    u32 process                = cmd_buff[13];
 
     LOG_WARNING(Service_LDR, "called (%s), loading CRO from 0x%08X to 0x%08X, size = 0x%X, "
         "data_segment = 0x%08X, data_size = 0x%X, bss_segment = 0x%08X, bss_size = 0x%X, "
-        "auto_link = %s, fix_level = %d, crr = 0x%08X",
+        "auto_link = %s, fix_level = %d, crr = 0x%08X. Process = 0x%08X",
         link_on_load_bug_fix ? "new" : "old",
         cro_buffer, cro_address, cro_size,
         data_segment_address, data_segment_size, bss_segment_address, bss_segment_size,
-        auto_link ? "true" : "false", fix_level, crr_address
+        auto_link ? "true" : "false", fix_level, crr_address, process
         );
+
+    if (descriptor != 0) {
+        LOG_ERROR(Service_LDR, "IPC handle descriptor failed validation (0x%X).", descriptor);
+        cmd_buff[0] = IPC::MakeHeader(0, 1, 0);
+        cmd_buff[1] = ResultCode(ErrorDescription::OS_InvalidBufferDescriptor, ErrorModule::OS, ErrorSummary::WrongArgument, ErrorLevel::Permanent).raw;
+        return;
+    }
+
+    memory_synchronizer.SynchronizeMappingMemory();
 
     cmd_buff[0] = IPC::MakeHeader(link_on_load_bug_fix ? 9 : 4, 2, 0);
 
@@ -1954,7 +2115,7 @@ static void LoadCRO(Service::Interface* self) {
 
     u32 fix_size = cro.Fix(fix_level);
 
-    memory_synchronizer.SynchronizeMemory();
+    memory_synchronizer.SynchronizeOriginalMemory();
 
     if (fix_size != cro_size) {
         std::shared_ptr<std::vector<u8>> fixed_cro_mem = std::make_shared<std::vector<u8>>(
@@ -1985,7 +2146,7 @@ static void LoadCRO(Service::Interface* self) {
  * LDR_RO::UnloadCRO service function
  *  Inputs:
  *      1 : mapped CRO pointer
- *      2 : zero?
+ *      2 : zero? (RO service doesn't care)
  *      3 : Original CRO pointer
  *      4 : Copy handle descriptor (zero)
  *      5 : KProcess handle
@@ -1996,10 +2157,21 @@ static void LoadCRO(Service::Interface* self) {
 static void UnloadCRO(Service::Interface* self) {
     u32* cmd_buff = Kernel::GetCommandBuffer();
     u32 cro_address = cmd_buff[1];
+    u32 descriptor  = cmd_buff[4];
+    u32 process     = cmd_buff[5];
+
+    if (descriptor != 0) {
+        LOG_ERROR(Service_LDR, "IPC handle descriptor failed validation (0x%X).", descriptor);
+        cmd_buff[0] = IPC::MakeHeader(0, 1, 0);
+        cmd_buff[1] = ResultCode(ErrorDescription::OS_InvalidBufferDescriptor, ErrorModule::OS, ErrorSummary::WrongArgument, ErrorLevel::Permanent).raw;
+        return;
+    }
 
     CROHelper cro(cro_address);
 
-    LOG_WARNING(Service_LDR, "Unloading CRO \"%s\" at 0x%08X", cro.ModuleName().data(), cro_address);
+    LOG_WARNING(Service_LDR, "Unloading CRO \"%s\" at 0x%08X. Process = 0x%08X", cro.ModuleName().data(), cro_address, process);
+
+    memory_synchronizer.SynchronizeMappingMemory();
 
     cmd_buff[0] = IPC::MakeHeader(5, 1, 0);
 
@@ -2017,13 +2189,19 @@ static void UnloadCRO(Service::Interface* self) {
 
     if (!cro.IsLoaded()) {
         LOG_ERROR(Service_LDR, "Invalid or not loaded CRO");
-        cmd_buff[1] = ERROR_INVALID_CRO.raw;
+        cmd_buff[1] = ERROR_NOT_LOADED.raw;
         return;
     }
 
     // TODO unprotect .text page
 
     u32 fixed_size = cro.GetFixedSize();
+
+    // Note that if the CRO iss not fixed (loaded with fix_level = 0),
+    // games will modify the .data section entry, making it pointing to the data in CRO buffer
+    // instead of the .data buffer, before calling UnloadCRO. In this case,
+    // any modification to the .data section (Unlink and ClearPatches) below.
+    // will actually do in CRO buffer.
 
     cro.Unregister();
 
@@ -2035,11 +2213,20 @@ static void UnloadCRO(Service::Interface* self) {
         return;
     }
 
-    // TODO if not fixed, clear all external/internal patches to restore the state before loading
+    // if the module is not fixed, clears all external/internal patches
+    // to restore the state before loading, so that it can be loaded again(?)
+    if (!cro.IsFixed()) {
+        result = cro.ClearPatches();
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error clearing patches %08X", result.raw);
+            cmd_buff[1] = result.raw;
+            return;
+        }
+    }
 
     cro.Unrebase();
 
-    memory_synchronizer.SynchronizeMemory();
+    memory_synchronizer.SynchronizeOriginalMemory();
 
     result = Kernel::g_current_process->vm_manager.UnmapRange(cro_address, fixed_size);
     if (result.IsError()) {
@@ -2065,9 +2252,20 @@ static void UnloadCRO(Service::Interface* self) {
 static void LinkCRO(Service::Interface* self) {
     u32* cmd_buff = Kernel::GetCommandBuffer();
     u32 cro_address = cmd_buff[1];
+    u32 descriptor  = cmd_buff[2];
+    u32 process     = cmd_buff[3];
+
+    if (descriptor != 0) {
+        LOG_ERROR(Service_LDR, "IPC handle descriptor failed validation (0x%X).", descriptor);
+        cmd_buff[0] = IPC::MakeHeader(0, 1, 0);
+        cmd_buff[1] = ResultCode(ErrorDescription::OS_InvalidBufferDescriptor, ErrorModule::OS, ErrorSummary::WrongArgument, ErrorLevel::Permanent).raw;
+        return;
+    }
 
     CROHelper cro(cro_address);
-    LOG_WARNING(Service_LDR, "Linking CRO \"%s\"", cro.ModuleName().data());
+    LOG_WARNING(Service_LDR, "Linking CRO \"%s\". Process = 0x%08X", cro.ModuleName().data(), process);
+
+    memory_synchronizer.SynchronizeMappingMemory();
 
     cmd_buff[0] = IPC::MakeHeader(6, 1, 0);
 
@@ -2085,7 +2283,7 @@ static void LinkCRO(Service::Interface* self) {
 
     if (!cro.IsLoaded()) {
         LOG_ERROR(Service_LDR, "Invalid or not loaded CRO");
-        cmd_buff[1] = ERROR_INVALID_CRO.raw;
+        cmd_buff[1] = ERROR_NOT_LOADED.raw;
         return;
     }
 
@@ -2094,7 +2292,7 @@ static void LinkCRO(Service::Interface* self) {
         LOG_ERROR(Service_LDR, "Error linking CRO %08X", result.raw);
     }
 
-    memory_synchronizer.SynchronizeMemory();
+    memory_synchronizer.SynchronizeOriginalMemory();
     Core::g_app_core->ClearInstructionCache();
 
     cmd_buff[1] = result.raw;
@@ -2113,9 +2311,20 @@ static void LinkCRO(Service::Interface* self) {
 static void UnlinkCRO(Service::Interface* self) {
     u32* cmd_buff = Kernel::GetCommandBuffer();
     u32 cro_address = cmd_buff[1];
+    u32 descriptor  = cmd_buff[2];
+    u32 process     = cmd_buff[3];
+
+    if (descriptor != 0) {
+        LOG_ERROR(Service_LDR, "IPC handle descriptor failed validation (0x%X).", descriptor);
+        cmd_buff[0] = IPC::MakeHeader(0, 1, 0);
+        cmd_buff[1] = ResultCode(ErrorDescription::OS_InvalidBufferDescriptor, ErrorModule::OS, ErrorSummary::WrongArgument, ErrorLevel::Permanent).raw;
+        return;
+    }
 
     CROHelper cro(cro_address);
-    LOG_WARNING(Service_LDR, "Unlinking CRO \"%s\"", cro.ModuleName().data());
+    LOG_WARNING(Service_LDR, "Unlinking CRO \"%s\". Process = 0x%08X", cro.ModuleName().data(), process);
+
+    memory_synchronizer.SynchronizeMappingMemory();
 
     cmd_buff[0] = IPC::MakeHeader(7, 1, 0);
 
@@ -2133,7 +2342,7 @@ static void UnlinkCRO(Service::Interface* self) {
 
     if (!cro.IsLoaded()) {
         LOG_ERROR(Service_LDR, "Invalid or not loaded CRO");
-        cmd_buff[1] = ERROR_INVALID_CRO.raw;
+        cmd_buff[1] = ERROR_NOT_LOADED.raw;
         return;
     }
 
@@ -2142,7 +2351,7 @@ static void UnlinkCRO(Service::Interface* self) {
         LOG_ERROR(Service_LDR, "Error unlinking CRO %08X", result.raw);
     }
 
-    memory_synchronizer.SynchronizeMemory();
+    memory_synchronizer.SynchronizeOriginalMemory();
     Core::g_app_core->ClearInstructionCache();
 
     cmd_buff[1] = result.raw;
@@ -2160,8 +2369,20 @@ static void UnlinkCRO(Service::Interface* self) {
  */
 static void Shutdown(Service::Interface* self) {
     u32* cmd_buff = Kernel::GetCommandBuffer();
+    u32 crs_buffer = cmd_buff[1];
+    u32 descriptor = cmd_buff[2];
+    u32 process    = cmd_buff[3];
 
-    LOG_WARNING(Service_LDR, "called, CRS buffer = 0x%08X", cmd_buff[1]);
+    LOG_WARNING(Service_LDR, "called, CRS buffer = 0x%08X, process = 0x%08X", crs_buffer, process);
+
+    if (descriptor != 0) {
+        LOG_ERROR(Service_LDR, "IPC handle descriptor failed validation (0x%X).", descriptor);
+        cmd_buff[0] = IPC::MakeHeader(0, 1, 0);
+        cmd_buff[1] = ResultCode(ErrorDescription::OS_InvalidBufferDescriptor, ErrorModule::OS, ErrorSummary::WrongArgument, ErrorLevel::Permanent).raw;
+        return;
+    }
+
+    memory_synchronizer.SynchronizeMappingMemory();
 
     if (!loaded_crs) {
         LOG_ERROR(Service_LDR, "Not initialized");
@@ -2174,7 +2395,7 @@ static void Shutdown(Service::Interface* self) {
     CROHelper crs(loaded_crs);
     crs.Unrebase(true);
 
-    memory_synchronizer.SynchronizeMemory();
+    memory_synchronizer.SynchronizeOriginalMemory();
 
     ResultCode result = Kernel::g_current_process->vm_manager.UnmapRange(loaded_crs, crs.GetFileSize());
     if (result.IsError()) {
