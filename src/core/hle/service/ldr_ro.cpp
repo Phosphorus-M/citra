@@ -2341,7 +2341,7 @@ static void LoadCRO(Service::Interface* self) {
 
     if (zero) {
         LOG_ERROR(Service_LDR, "Zero is not zero %d", zero);
-        cmd_buff[1] = ERROR_ILLEGAL_ADDRESS.raw;
+        cmd_buff[1] = ResultCode(static_cast<ErrorDescription>(29), ErrorModule::RO, ErrorSummary::Internal, ErrorLevel::Usage).raw;
         return;
     }
 
@@ -2414,7 +2414,7 @@ static void LoadCRO(Service::Interface* self) {
     u32 exe_size;
     std::tie(exe_begin, exe_size) = cro.GetExecutablePages();
     if (exe_begin) {
-        result = Kernel::g_current_process->vm_manager.ReprotectRange(exe_begin,exe_size, Kernel::VMAPermission::ReadExecute);
+        result = Kernel::g_current_process->vm_manager.ReprotectRange(exe_begin, exe_size, Kernel::VMAPermission::ReadExecute);
         if (result.IsError()) {
             LOG_ERROR(Service_LDR, "Error reprotecting memory block %08X", result.raw);
             Kernel::g_current_process->vm_manager.UnmapRange(cro_address, fix_size);
