@@ -2137,26 +2137,32 @@ static void Initialize(Service::Interface* self) {
         return;
     }
 
-    ResultCode result(RESULT_SUCCESS.raw);
+    ResultCode result = RESULT_SUCCESS;
 
-    // TODO(wwylele): should be memory aliasing
-    std::shared_ptr<std::vector<u8>> crs_mem = std::make_shared<std::vector<u8>>(crs_size);
-    Memory::ReadBlock(crs_buffer_ptr, crs_mem->data(), crs_size);
-    result = Kernel::g_current_process->vm_manager.MapMemoryBlock(crs_address, crs_mem, 0, crs_size, Kernel::MemoryState::Code).Code();
-    if (result.IsError()) {
-        LOG_ERROR(Service_LDR, "Error mapping memory block %08X", result.raw);
-        cmd_buff[1] = result.raw;
-        return;
+    if (crs_buffer_ptr != crs_address) {
+        // TODO(wwylele): should be memory aliasing
+        std::shared_ptr<std::vector<u8>> crs_mem = std::make_shared<std::vector<u8>>(crs_size);
+        Memory::ReadBlock(crs_buffer_ptr, crs_mem->data(), crs_size);
+        result = Kernel::g_current_process->vm_manager.MapMemoryBlock(crs_address, crs_mem, 0, crs_size, Kernel::MemoryState::Code).Code();
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error mapping memory block %08X", result.raw);
+            cmd_buff[1] = result.raw;
+            return;
+        }
+
+        result = Kernel::g_current_process->vm_manager.ReprotectRange(crs_address, crs_size, Kernel::VMAPermission::Read);
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error reprotecting memory block %08X", result.raw);
+            cmd_buff[1] = result.raw;
+            return;
+        }
+
+        memory_synchronizer.AddMemoryBlock(crs_address, crs_buffer_ptr, crs_size);
+    } else {
+        // Do nothing if buffer_ptr == address
+        // TODO(wwylele): verify this behaviour
+        LOG_WARNING(Service_LDR, "crs_buffer_ptr == crs_address (0x%08X)", crs_address);
     }
-
-    result = Kernel::g_current_process->vm_manager.ReprotectRange(crs_address, crs_size, Kernel::VMAPermission::Read);
-    if (result.IsError()) {
-        LOG_ERROR(Service_LDR, "Error reprotecting memory block %08X", result.raw);
-        cmd_buff[1] = result.raw;
-        return;
-    }
-
-    memory_synchronizer.AddMemoryBlock(crs_address, crs_buffer_ptr, crs_size);
 
     CROHelper crs(crs_address);
     crs.InitCRS();
@@ -2345,25 +2351,33 @@ static void LoadCRO(Service::Interface* self) {
         return;
     }
 
-    // TODO(wwylele): should be memory aliasing
-    std::shared_ptr<std::vector<u8>> cro_mem = std::make_shared<std::vector<u8>>(cro_size);
-    Memory::ReadBlock(cro_buffer_ptr, cro_mem->data(), cro_size);
-    ResultCode result = Kernel::g_current_process->vm_manager.MapMemoryBlock(cro_address, cro_mem, 0, cro_size, Kernel::MemoryState::Code).Code();
-    if (result.IsError()) {
-        LOG_ERROR(Service_LDR, "Error mapping memory block %08X", result.raw);
-        cmd_buff[1] = result.raw;
-        return;
-    }
+    ResultCode result = RESULT_SUCCESS;
 
-    result = Kernel::g_current_process->vm_manager.ReprotectRange(cro_address, cro_size, Kernel::VMAPermission::Read);
-    if (result.IsError()) {
-        LOG_ERROR(Service_LDR, "Error reprotecting memory block %08X", result.raw);
-        Kernel::g_current_process->vm_manager.UnmapRange(cro_address, cro_size);
-        cmd_buff[1] = result.raw;
-        return;
-    }
+    if (cro_buffer_ptr != cro_address) {
+        // TODO(wwylele): should be memory aliasing
+        std::shared_ptr<std::vector<u8>> cro_mem = std::make_shared<std::vector<u8>>(cro_size);
+        Memory::ReadBlock(cro_buffer_ptr, cro_mem->data(), cro_size);
+        result = Kernel::g_current_process->vm_manager.MapMemoryBlock(cro_address, cro_mem, 0, cro_size, Kernel::MemoryState::Code).Code();
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error mapping memory block %08X", result.raw);
+            cmd_buff[1] = result.raw;
+            return;
+        }
 
-    memory_synchronizer.AddMemoryBlock(cro_address, cro_buffer_ptr, cro_size);
+        result = Kernel::g_current_process->vm_manager.ReprotectRange(cro_address, cro_size, Kernel::VMAPermission::Read);
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error reprotecting memory block %08X", result.raw);
+            Kernel::g_current_process->vm_manager.UnmapRange(cro_address, cro_size);
+            cmd_buff[1] = result.raw;
+            return;
+        }
+
+        memory_synchronizer.AddMemoryBlock(cro_address, cro_buffer_ptr, cro_size);
+    } else {
+        // Do nothing if buffer_ptr == address
+        // TODO(wwylele): verify this behaviour
+        LOG_WARNING(Service_LDR, "cro_buffer_ptr == cro_address (0x%08X)", cro_address);
+    }
 
     CROHelper cro(cro_address);
 
@@ -2397,18 +2411,21 @@ static void LoadCRO(Service::Interface* self) {
 
     memory_synchronizer.SynchronizeOriginalMemory();
 
-    if (fix_size != cro_size) {
-        result = Kernel::g_current_process->vm_manager.UnmapRange(cro_address + fix_size, cro_size - fix_size);
-        if (result.IsError()) {
-            LOG_ERROR(Service_LDR, "Error unmapping memory block %08X", result.raw);
-            Kernel::g_current_process->vm_manager.UnmapRange(cro_address, cro_size);
-            cmd_buff[1] = result.raw;
-            return;
+    // TODO(wwylele): verify the behaviour when buffer_ptr == address
+    if (cro_buffer_ptr != cro_address) {
+        if (fix_size != cro_size) {
+            result = Kernel::g_current_process->vm_manager.UnmapRange(cro_address + fix_size, cro_size - fix_size);
+            if (result.IsError()) {
+                LOG_ERROR(Service_LDR, "Error unmapping memory block %08X", result.raw);
+                Kernel::g_current_process->vm_manager.UnmapRange(cro_address, cro_size);
+                cmd_buff[1] = result.raw;
+                return;
+            }
         }
-    }
 
-    // Changes the block size
-    memory_synchronizer.AddMemoryBlock(cro_address, cro_buffer_ptr, fix_size);
+        // Changes the block size
+        memory_synchronizer.AddMemoryBlock(cro_address, cro_buffer_ptr, fix_size);
+    }
 
     VAddr exe_begin;
     u32 exe_size;
@@ -2448,12 +2465,12 @@ static void UnloadCRO(Service::Interface* self) {
     u32* cmd_buff = Kernel::GetCommandBuffer();
     VAddr cro_address      = cmd_buff[1];
     u32 zero               = cmd_buff[2];
-    VAddr original_buffer  = cmd_buff[3];
+    VAddr cro_buffer_ptr   = cmd_buff[3];
     u32 descriptor         = cmd_buff[4];
     u32 process            = cmd_buff[5];
 
-    LOG_DEBUG(Service_LDR, "called, cro_address=0x%08X, zero=%d, original_buffer=0x%08X, descriptor=0x%08X, process=0x%08X",
-        cro_address, zero, original_buffer, descriptor, process);
+    LOG_DEBUG(Service_LDR, "called, cro_address=0x%08X, zero=%d, cro_buffer_ptr=0x%08X, descriptor=0x%08X, process=0x%08X",
+        cro_address, zero, cro_buffer_ptr, descriptor, process);
 
     if (descriptor != 0) {
         LOG_ERROR(Service_LDR, "IPC handle descriptor failed validation (0x%X).", descriptor);
@@ -2520,11 +2537,18 @@ static void UnloadCRO(Service::Interface* self) {
 
     memory_synchronizer.SynchronizeOriginalMemory();
 
-    result = Kernel::g_current_process->vm_manager.UnmapRange(cro_address, fixed_size);
-    if (result.IsError()) {
-        LOG_ERROR(Service_LDR, "Error unmapping CRO %08X", result.raw);
+    // TODO(wwylele): verify the behaviour is correct when buffer_ptr == address
+    if (cro_address != cro_buffer_ptr) {
+        result = Kernel::g_current_process->vm_manager.UnmapRange(cro_address, fixed_size);
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error unmapping CRO %08X", result.raw);
+        }
+        memory_synchronizer.RemoveMemoryBlock(cro_address);
+    } else {
+        // Do nothing if buffer_ptr == address
+        // TODO(wwylele): verify this behaviour
+        LOG_WARNING(Service_LDR, "cro_buffer_ptr == cro_address (0x%08X)", cro_address);
     }
-    memory_synchronizer.RemoveMemoryBlock(cro_address);
 
     Core::g_app_core->ClearInstructionCache();
 
@@ -2698,11 +2722,19 @@ static void Shutdown(Service::Interface* self) {
 
     memory_synchronizer.SynchronizeOriginalMemory();
 
-    ResultCode result = Kernel::g_current_process->vm_manager.UnmapRange(loaded_crs, crs.GetFileSize());
-    if (result.IsError()) {
-        LOG_ERROR(Service_LDR, "Error unmapping CRS %08X", result.raw);
+    ResultCode result = RESULT_SUCCESS;
+
+    if (loaded_crs != crs_buffer_ptr) {
+        result = Kernel::g_current_process->vm_manager.UnmapRange(loaded_crs, crs.GetFileSize());
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error unmapping CRS %08X", result.raw);
+        }
+        memory_synchronizer.RemoveMemoryBlock(loaded_crs);
+    } else {
+        // Do nothing if buffer_ptr == address
+        // TODO(wwylele): verify this behaviour
+        LOG_WARNING(Service_LDR, "crs_buffer_ptr == crs_address (0x%08X)", crs_buffer_ptr);
     }
-    memory_synchronizer.RemoveMemoryBlock(loaded_crs);
 
     loaded_crs = 0;
     cmd_buff[1] = result.raw;
