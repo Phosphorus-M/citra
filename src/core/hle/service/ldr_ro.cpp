@@ -1340,7 +1340,7 @@ class CROHelper final {
             ExternalPatchEntry patch_entry;
             Memory::ReadBlock(patch_addr, &patch_entry, sizeof(ExternalPatchEntry));
 
-            if (!patch_entry.is_batch_resolved) {
+            if (patch_entry.is_batch_resolved) {
                 std::string symbol_name = Memory::GetString(entry.name_offset, target_import_strings_size);
                 u32 symbol_address = FindExportNamedSymbol(symbol_name);
                 if (symbol_address) {
