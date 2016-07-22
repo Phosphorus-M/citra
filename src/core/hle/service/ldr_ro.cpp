@@ -273,44 +273,6 @@ class CROHelper final {
         Memory::Write32(Field(field), value);
     }
 
-    VAddr Next() const {
-        return GetField(NextCRO);
-    }
-
-    VAddr Previous() const {
-        return GetField(PreviousCRO);
-    }
-
-    void SetNext(VAddr next) {
-        SetField(NextCRO, next);
-    }
-
-    void SetPrevious(VAddr next) {
-        SetField(PreviousCRO, next);
-    }
-
-    /**
-     * Iterates over all registered auto-link modules, including the static module.
-     * @param crs_address the virtual address of the static module
-     * @param func a function object to operate on a module. It accepts one parameter
-     *        CROHelper and returns ResultVal<bool>. It should return true to continue the iteration,
-     *        false to stop the iteration, or an error code (which will also stop the iteration).
-     * @returns ResultCode indicating the result of the operation, RESULT_SUCCESS if all iteration success,
-     *         otherwise error code of the last iteration.
-     */
-    template <typename FunctionObject>
-    static ResultCode ForEachAutoLinkCRO(VAddr crs_address, FunctionObject func) {
-        VAddr current = crs_address;
-        while (current) {
-            CROHelper cro(current);
-            CASCADE_RESULT(bool next, func(cro));
-            if (!next)
-                break;
-            current = cro.Next();
-        }
-        return RESULT_SUCCESS;
-    }
-
     /**
      * Reads an entry in one of module tables.
      * @param index index of the entry
@@ -353,6 +315,146 @@ class CROHelper final {
             return 0;
 
         return entry.offset + segment_tag.offset_into_segment;
+    }
+
+    VAddr Next() const {
+        return GetField(NextCRO);
+    }
+
+    VAddr Previous() const {
+        return GetField(PreviousCRO);
+    }
+
+    void SetNext(VAddr next) {
+        SetField(NextCRO, next);
+    }
+
+    void SetPrevious(VAddr next) {
+        SetField(PreviousCRO, next);
+    }
+
+    /**
+     * Iterates over all registered auto-link modules, including the static module.
+     * @param crs_address the virtual address of the static module
+     * @param func a function object to operate on a module. It accepts one parameter
+     *        CROHelper and returns ResultVal<bool>. It should return true to continue the iteration,
+     *        false to stop the iteration, or an error code (which will also stop the iteration).
+     * @returns ResultCode indicating the result of the operation, RESULT_SUCCESS if all iteration success,
+     *         otherwise error code of the last iteration.
+     */
+    template <typename FunctionObject>
+    static ResultCode ForEachAutoLinkCRO(VAddr crs_address, FunctionObject func) {
+        VAddr current = crs_address;
+        while (current) {
+            CROHelper cro(current);
+            CASCADE_RESULT(bool next, func(cro));
+            if (!next)
+                break;
+            current = cro.Next();
+        }
+        return RESULT_SUCCESS;
+    }
+
+    /**
+     * Applies a patch
+     * @param target_address where to apply the patch
+     * @param patch_type the type of the patch
+     * @param shift address shift apply to the patched symbol
+     * @param symbol_address the symbol address to be patched with
+     * @param target_future_address the future address of the target.
+     *        Usually equals to target_address, but will be different for a target in .data segment
+     * @returns ResultCode RESULT_SUCCESS on success, otherwise error code.
+     */
+    ResultCode ApplyPatch(VAddr target_address, PatchType patch_type, u32 shift, u32 symbol_address, u32 target_future_address) {
+        switch (patch_type) {
+            case PatchType::Nothing:
+                break;
+            case PatchType::AbsoluteAddress:
+            case PatchType::AbsoluteAddress2:
+                Memory::Write32(target_address, symbol_address + shift);
+                break;
+            case PatchType::RelativeAddress:
+                Memory::Write32(target_address, symbol_address + shift - target_future_address);
+                break;
+            case PatchType::ThumbBranch:
+            case PatchType::ArmBranch:
+            case PatchType::ModifyArmBranch:
+            case PatchType::AlignedRelativeAddress:
+                // TODO(wwylele): implement other types
+                UNIMPLEMENTED();
+                break;
+            default:
+                return CROFormatError(0x22);
+        }
+        return RESULT_SUCCESS;
+    }
+
+    /**
+     * Clears a patch to zero
+     * @param target_address where to apply the patch
+     * @param patch_type the type of the patch
+     * @returns ResultCode RESULT_SUCCESS on success, otherwise error code.
+     */
+    ResultCode ClearPatch(VAddr target_address, PatchType patch_type) {
+        switch (patch_type) {
+            case PatchType::Nothing:
+                break;
+            case PatchType::AbsoluteAddress:
+            case PatchType::AbsoluteAddress2:
+            case PatchType::RelativeAddress:
+                Memory::Write32(target_address, 0);
+                break;
+            case PatchType::ThumbBranch:
+            case PatchType::ArmBranch:
+            case PatchType::ModifyArmBranch:
+            case PatchType::AlignedRelativeAddress:
+                // TODO(wwylele): implement other types
+                UNIMPLEMENTED();
+                break;
+            default:
+                return CROFormatError(0x22);
+        }
+        return RESULT_SUCCESS;
+    }
+
+    /**
+     * Applies or resets a batch of patch
+     * @param batch the virtual address of the first patch in the batch
+     * @param symbol_address the symbol address to be patched with
+     * @param reset false to set the batch to resolved state, true to reset the batch to unresolved state
+     * @returns ResultCode RESULT_SUCCESS on success, otherwise error code.
+     */
+    ResultCode ApplyPatchBatch(VAddr batch, u32 symbol_address, bool reset = false) {
+        if (symbol_address == 0 && !reset)
+            return CROFormatError(0x10);
+
+        VAddr patch_address = batch;
+        while (true) {
+            PatchEntry patch;
+            Memory::ReadBlock(patch_address, &patch, sizeof(PatchEntry));
+
+            VAddr patch_target = SegmentTagToAddress(patch.target_position);
+            if (patch_target == 0) {
+                return CROFormatError(0x12);
+            }
+
+            ResultCode result = ApplyPatch(patch_target, patch.type, patch.shift, symbol_address, patch_target);
+            if (result.IsError()) {
+                LOG_ERROR(Service_LDR, "Error applying patch %08X", result.raw);
+                return result;
+            }
+
+            if (patch.is_batch_end)
+                break;
+
+            patch_address += sizeof(PatchEntry);
+        }
+
+        PatchEntry patch;
+        Memory::ReadBlock(batch, &patch, sizeof(PatchEntry));
+        patch.is_batch_resolved = reset ? 0 : 1;
+        Memory::WriteBlock(batch, &patch, sizeof(PatchEntry));
+        return RESULT_SUCCESS;
     }
 
     /**
@@ -720,68 +822,6 @@ class CROHelper final {
     }
 
     /**
-     * Applies a patch
-     * @param target_address where to apply the patch
-     * @param patch_type the type of the patch
-     * @param shift address shift apply to the patched symbol
-     * @param symbol_address the symbol address to be patched with
-     * @param target_future_address the future address of the target.
-     *        Usually equals to target_address, but will be different for a target in .data segment
-     * @returns ResultCode RESULT_SUCCESS on success, otherwise error code.
-     */
-    ResultCode ApplyPatch(VAddr target_address, PatchType patch_type, u32 shift, u32 symbol_address, u32 target_future_address) {
-        switch (patch_type) {
-            case PatchType::Nothing:
-                break;
-            case PatchType::AbsoluteAddress:
-            case PatchType::AbsoluteAddress2:
-                Memory::Write32(target_address, symbol_address + shift);
-                break;
-            case PatchType::RelativeAddress:
-                Memory::Write32(target_address, symbol_address + shift - target_future_address);
-                break;
-            case PatchType::ThumbBranch:
-            case PatchType::ArmBranch:
-            case PatchType::ModifyArmBranch:
-            case PatchType::AlignedRelativeAddress:
-                // TODO(wwylele): implement other types
-                UNIMPLEMENTED();
-                break;
-            default:
-                return CROFormatError(0x22);
-        }
-        return RESULT_SUCCESS;
-    }
-
-    /**
-     * Clears a patch to zero
-     * @param target_address where to apply the patch
-     * @param patch_type the type of the patch
-     * @returns ResultCode RESULT_SUCCESS on success, otherwise error code.
-     */
-    ResultCode ClearPatch(VAddr target_address, PatchType patch_type) {
-        switch (patch_type) {
-            case PatchType::Nothing:
-                break;
-            case PatchType::AbsoluteAddress:
-            case PatchType::AbsoluteAddress2:
-            case PatchType::RelativeAddress:
-                Memory::Write32(target_address, 0);
-                break;
-            case PatchType::ThumbBranch:
-            case PatchType::ArmBranch:
-            case PatchType::ModifyArmBranch:
-            case PatchType::AlignedRelativeAddress:
-                // TODO(wwylele): implement other types
-                UNIMPLEMENTED();
-                break;
-            default:
-                return CROFormatError(0x22);
-        }
-        return RESULT_SUCCESS;
-    }
-
-    /**
      * Resets all external patches to unresolved state.
      * @returns ResultCode RESULT_SUCCESS on success, otherwise error code.
      */
@@ -857,46 +897,6 @@ class CROHelper final {
             batch_begin = patch.is_batch_end != 0;
         }
 
-        return RESULT_SUCCESS;
-    }
-
-    /**
-     * Applies or resets a batch of patch
-     * @param batch the virtual address of the first patch in the batch
-     * @param symbol_address the symbol address to be patched with
-     * @param reset false to set the batch to resolved state, true to reset the batch to unresolved state
-     * @returns ResultCode RESULT_SUCCESS on success, otherwise error code.
-     */
-    ResultCode ApplyPatchBatch(VAddr batch, u32 symbol_address, bool reset = false) {
-        if (symbol_address == 0 && !reset)
-            return CROFormatError(0x10);
-
-        VAddr patch_address = batch;
-        while (true) {
-            PatchEntry patch;
-            Memory::ReadBlock(patch_address, &patch, sizeof(PatchEntry));
-
-            VAddr patch_target = SegmentTagToAddress(patch.target_position);
-            if (patch_target == 0) {
-                return CROFormatError(0x12);
-            }
-
-            ResultCode result = ApplyPatch(patch_target, patch.type, patch.shift, symbol_address, patch_target);
-            if (result.IsError()) {
-                LOG_ERROR(Service_LDR, "Error applying patch %08X", result.raw);
-                return result;
-            }
-
-            if (patch.is_batch_end)
-                break;
-
-            patch_address += sizeof(PatchEntry);
-        }
-
-        PatchEntry patch;
-        Memory::ReadBlock(batch, &patch, sizeof(PatchEntry));
-        patch.is_batch_resolved = reset ? 0 : 1;
-        Memory::WriteBlock(batch, &patch, sizeof(PatchEntry));
         return RESULT_SUCCESS;
     }
 
@@ -1340,7 +1340,7 @@ class CROHelper final {
             ExternalPatchEntry patch_entry;
             Memory::ReadBlock(patch_addr, &patch_entry, sizeof(ExternalPatchEntry));
 
-            if (!patch_entry.is_batch_resolved) {
+            if (patch_entry.is_batch_resolved) {
                 std::string symbol_name = Memory::GetString(entry.name_offset, target_import_strings_size);
                 u32 symbol_address = FindExportNamedSymbol(symbol_name);
                 if (symbol_address) {
@@ -1505,10 +1505,6 @@ public:
 
     u32 GetFileSize() const {
         return GetField(FileSize);
-    }
-
-    u32 GetFixedSize() const {
-        return GetField(FixedSize);
     }
 
     /**
@@ -1946,6 +1942,14 @@ public:
         return fixed_size;
     }
 
+    bool IsFixed() const {
+        return GetField(Magic) == MAGIC_FIXD;
+    }
+
+    u32 GetFixedSize() const {
+        return GetField(FixedSize);
+    }
+
     bool IsLoaded() const {
         u32 magic = GetField(Magic);
         if (magic != MAGIC_CRO0 && magic != MAGIC_FIXD)
@@ -1954,10 +1958,6 @@ public:
         // TODO(wwylele): verify memory state here after memory aliasing is implemented
 
         return true;
-    }
-
-    bool IsFixed() const {
-        return GetField(Magic) == MAGIC_FIXD;
     }
 
     /**
@@ -2137,26 +2137,32 @@ static void Initialize(Service::Interface* self) {
         return;
     }
 
-    ResultCode result(RESULT_SUCCESS.raw);
+    ResultCode result = RESULT_SUCCESS;
 
-    // TODO(wwylele): should be memory aliasing
-    std::shared_ptr<std::vector<u8>> crs_mem = std::make_shared<std::vector<u8>>(crs_size);
-    Memory::ReadBlock(crs_buffer_ptr, crs_mem->data(), crs_size);
-    result = Kernel::g_current_process->vm_manager.MapMemoryBlock(crs_address, crs_mem, 0, crs_size, Kernel::MemoryState::Code).Code();
-    if (result.IsError()) {
-        LOG_ERROR(Service_LDR, "Error mapping memory block %08X", result.raw);
-        cmd_buff[1] = result.raw;
-        return;
+    if (crs_buffer_ptr != crs_address) {
+        // TODO(wwylele): should be memory aliasing
+        std::shared_ptr<std::vector<u8>> crs_mem = std::make_shared<std::vector<u8>>(crs_size);
+        Memory::ReadBlock(crs_buffer_ptr, crs_mem->data(), crs_size);
+        result = Kernel::g_current_process->vm_manager.MapMemoryBlock(crs_address, crs_mem, 0, crs_size, Kernel::MemoryState::Code).Code();
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error mapping memory block %08X", result.raw);
+            cmd_buff[1] = result.raw;
+            return;
+        }
+
+        result = Kernel::g_current_process->vm_manager.ReprotectRange(crs_address, crs_size, Kernel::VMAPermission::Read);
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error reprotecting memory block %08X", result.raw);
+            cmd_buff[1] = result.raw;
+            return;
+        }
+
+        memory_synchronizer.AddMemoryBlock(crs_address, crs_buffer_ptr, crs_size);
+    } else {
+        // Do nothing if buffer_ptr == address
+        // TODO(wwylele): verify this behaviour
+        LOG_WARNING(Service_LDR, "crs_buffer_ptr == crs_address (0x%08X)", crs_address);
     }
-
-    result = Kernel::g_current_process->vm_manager.ReprotectRange(crs_address, crs_size, Kernel::VMAPermission::Read);
-    if (result.IsError()) {
-        LOG_ERROR(Service_LDR, "Error reprotecting memory block %08X", result.raw);
-        cmd_buff[1] = result.raw;
-        return;
-    }
-
-    memory_synchronizer.AddMemoryBlock(crs_address, crs_buffer_ptr, crs_size);
 
     CROHelper crs(crs_address);
     crs.InitCRS();
@@ -2345,25 +2351,33 @@ static void LoadCRO(Service::Interface* self) {
         return;
     }
 
-    // TODO(wwylele): should be memory aliasing
-    std::shared_ptr<std::vector<u8>> cro_mem = std::make_shared<std::vector<u8>>(cro_size);
-    Memory::ReadBlock(cro_buffer_ptr, cro_mem->data(), cro_size);
-    ResultCode result = Kernel::g_current_process->vm_manager.MapMemoryBlock(cro_address, cro_mem, 0, cro_size, Kernel::MemoryState::Code).Code();
-    if (result.IsError()) {
-        LOG_ERROR(Service_LDR, "Error mapping memory block %08X", result.raw);
-        cmd_buff[1] = result.raw;
-        return;
-    }
+    ResultCode result = RESULT_SUCCESS;
 
-    result = Kernel::g_current_process->vm_manager.ReprotectRange(cro_address, cro_size, Kernel::VMAPermission::Read);
-    if (result.IsError()) {
-        LOG_ERROR(Service_LDR, "Error reprotecting memory block %08X", result.raw);
-        Kernel::g_current_process->vm_manager.UnmapRange(cro_address, cro_size);
-        cmd_buff[1] = result.raw;
-        return;
-    }
+    if (cro_buffer_ptr != cro_address) {
+        // TODO(wwylele): should be memory aliasing
+        std::shared_ptr<std::vector<u8>> cro_mem = std::make_shared<std::vector<u8>>(cro_size);
+        Memory::ReadBlock(cro_buffer_ptr, cro_mem->data(), cro_size);
+        result = Kernel::g_current_process->vm_manager.MapMemoryBlock(cro_address, cro_mem, 0, cro_size, Kernel::MemoryState::Code).Code();
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error mapping memory block %08X", result.raw);
+            cmd_buff[1] = result.raw;
+            return;
+        }
 
-    memory_synchronizer.AddMemoryBlock(cro_address, cro_buffer_ptr, cro_size);
+        result = Kernel::g_current_process->vm_manager.ReprotectRange(cro_address, cro_size, Kernel::VMAPermission::Read);
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error reprotecting memory block %08X", result.raw);
+            Kernel::g_current_process->vm_manager.UnmapRange(cro_address, cro_size);
+            cmd_buff[1] = result.raw;
+            return;
+        }
+
+        memory_synchronizer.AddMemoryBlock(cro_address, cro_buffer_ptr, cro_size);
+    } else {
+        // Do nothing if buffer_ptr == address
+        // TODO(wwylele): verify this behaviour
+        LOG_WARNING(Service_LDR, "cro_buffer_ptr == cro_address (0x%08X)", cro_address);
+    }
 
     CROHelper cro(cro_address);
 
@@ -2397,18 +2411,21 @@ static void LoadCRO(Service::Interface* self) {
 
     memory_synchronizer.SynchronizeOriginalMemory();
 
-    if (fix_size != cro_size) {
-        result = Kernel::g_current_process->vm_manager.UnmapRange(cro_address + fix_size, cro_size - fix_size);
-        if (result.IsError()) {
-            LOG_ERROR(Service_LDR, "Error unmapping memory block %08X", result.raw);
-            Kernel::g_current_process->vm_manager.UnmapRange(cro_address, cro_size);
-            cmd_buff[1] = result.raw;
-            return;
+    // TODO(wwylele): verify the behaviour when buffer_ptr == address
+    if (cro_buffer_ptr != cro_address) {
+        if (fix_size != cro_size) {
+            result = Kernel::g_current_process->vm_manager.UnmapRange(cro_address + fix_size, cro_size - fix_size);
+            if (result.IsError()) {
+                LOG_ERROR(Service_LDR, "Error unmapping memory block %08X", result.raw);
+                Kernel::g_current_process->vm_manager.UnmapRange(cro_address, cro_size);
+                cmd_buff[1] = result.raw;
+                return;
+            }
         }
-    }
 
-    // Changes the block size
-    memory_synchronizer.AddMemoryBlock(cro_address, cro_buffer_ptr, fix_size);
+        // Changes the block size
+        memory_synchronizer.AddMemoryBlock(cro_address, cro_buffer_ptr, fix_size);
+    }
 
     VAddr exe_begin;
     u32 exe_size;
@@ -2448,12 +2465,12 @@ static void UnloadCRO(Service::Interface* self) {
     u32* cmd_buff = Kernel::GetCommandBuffer();
     VAddr cro_address      = cmd_buff[1];
     u32 zero               = cmd_buff[2];
-    VAddr original_buffer  = cmd_buff[3];
+    VAddr cro_buffer_ptr   = cmd_buff[3];
     u32 descriptor         = cmd_buff[4];
     u32 process            = cmd_buff[5];
 
-    LOG_DEBUG(Service_LDR, "called, cro_address=0x%08X, zero=%d, original_buffer=0x%08X, descriptor=0x%08X, process=0x%08X",
-        cro_address, zero, original_buffer, descriptor, process);
+    LOG_DEBUG(Service_LDR, "called, cro_address=0x%08X, zero=%d, cro_buffer_ptr=0x%08X, descriptor=0x%08X, process=0x%08X",
+        cro_address, zero, cro_buffer_ptr, descriptor, process);
 
     if (descriptor != 0) {
         LOG_ERROR(Service_LDR, "IPC handle descriptor failed validation (0x%X).", descriptor);
@@ -2520,11 +2537,18 @@ static void UnloadCRO(Service::Interface* self) {
 
     memory_synchronizer.SynchronizeOriginalMemory();
 
-    result = Kernel::g_current_process->vm_manager.UnmapRange(cro_address, fixed_size);
-    if (result.IsError()) {
-        LOG_ERROR(Service_LDR, "Error unmapping CRO %08X", result.raw);
+    // TODO(wwylele): verify the behaviour is correct when buffer_ptr == address
+    if (cro_address != cro_buffer_ptr) {
+        result = Kernel::g_current_process->vm_manager.UnmapRange(cro_address, fixed_size);
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error unmapping CRO %08X", result.raw);
+        }
+        memory_synchronizer.RemoveMemoryBlock(cro_address);
+    } else {
+        // Do nothing if buffer_ptr == address
+        // TODO(wwylele): verify this behaviour
+        LOG_WARNING(Service_LDR, "cro_buffer_ptr == cro_address (0x%08X)", cro_address);
     }
-    memory_synchronizer.RemoveMemoryBlock(cro_address);
 
     Core::g_app_core->ClearInstructionCache();
 
@@ -2698,11 +2722,19 @@ static void Shutdown(Service::Interface* self) {
 
     memory_synchronizer.SynchronizeOriginalMemory();
 
-    ResultCode result = Kernel::g_current_process->vm_manager.UnmapRange(loaded_crs, crs.GetFileSize());
-    if (result.IsError()) {
-        LOG_ERROR(Service_LDR, "Error unmapping CRS %08X", result.raw);
+    ResultCode result = RESULT_SUCCESS;
+
+    if (loaded_crs != crs_buffer_ptr) {
+        result = Kernel::g_current_process->vm_manager.UnmapRange(loaded_crs, crs.GetFileSize());
+        if (result.IsError()) {
+            LOG_ERROR(Service_LDR, "Error unmapping CRS %08X", result.raw);
+        }
+        memory_synchronizer.RemoveMemoryBlock(loaded_crs);
+    } else {
+        // Do nothing if buffer_ptr == address
+        // TODO(wwylele): verify this behaviour
+        LOG_WARNING(Service_LDR, "crs_buffer_ptr == crs_address (0x%08X)", crs_buffer_ptr);
     }
-    memory_synchronizer.RemoveMemoryBlock(loaded_crs);
 
     loaded_crs = 0;
     cmd_buff[1] = result.raw;
