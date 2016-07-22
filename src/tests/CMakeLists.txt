@@ -1,8 +1,11 @@
 set(SRCS
             tests.cpp
+            core/arm/arm_test_common.cpp
+            core/arm/dyncom/arm_dyncom_tests.cpp
             )
 
 set(HEADERS
+            core/arm/arm_test_common.h
             )
 
 create_directory_groups(${SRCS} ${HEADERS})
