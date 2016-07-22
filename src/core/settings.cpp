@@ -32,7 +32,6 @@ void Apply() {
     }
 
     AudioCore::SelectSink(values.sink_id);
-
 }
 
 } // namespace

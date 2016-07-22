@@ -91,6 +91,7 @@ struct Values {
 
     // Audio
     std::string sink_id;
+    std::string audio_device_id;
 
     // Debugging
     bool use_gdbstub;
